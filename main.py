@@ -5,6 +5,7 @@ import sys
 from telethon import TelegramClient, events, functions, errors
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
+from aiohttp import web
 
 load_dotenv()
 
@@ -17,9 +18,10 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH")
 SESSION_STRING = os.environ.get("SESSION_STRING")
 if SESSION_STRING:
-    SESSION_STRING = SESSION_STRING.strip() # Clean whitespace
+    SESSION_STRING = SESSION_STRING.strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+PORT = int(os.environ.get("PORT", 8080))
 
 if not API_ID or not API_HASH:
     logger.error("Missing API_ID or API_HASH! Please check your environment variables.")
@@ -39,7 +41,6 @@ if SESSION_STRING:
             session = 'bot_session'
         else:
             logger.critical("🛑 Critical Error: SESSION_STRING is invalid and no BOT_TOKEN provided. Cannot start.")
-            logger.critical("Please check your Render Environment Variables. Did you copy the string correctly?")
             sys.exit(1)
 else:
     if BOT_TOKEN:
@@ -53,38 +54,26 @@ else:
 client = TelegramClient(session, API_ID, API_HASH)
 
 async def check_auth(event):
-    """
-    Verifies if the command sender is authorized.
-    """
+    """Verifies if the command sender is authorized."""
     sender_id = event.sender_id
-    
-    # 1. Bot Mode: Only allow the ADMIN_ID
     if BOT_TOKEN and (not SESSION_STRING or session == 'bot_session'):
         if sender_id == ADMIN_ID:
             return True
         else:
             return False
-            
-    # 2. Userbot Mode: Only allow the User themselves
     else:
         me = await client.get_me()
         return sender_id == me.id
 
 @client.on(events.NewMessage(pattern=r'^\.status$'))
 async def status_handler(event):
-    """Check if the bot is running."""
     if not await check_auth(event):
         return
-
     mode = "Bot" if (BOT_TOKEN and session == 'bot_session') else "Userbot"
     await event.reply(f"✅ **{mode}** is running and ready on Render!")
 
 @client.on(events.NewMessage(pattern=r'^\.scrape (\S+) (\S+)$'))
 async def scrape_handler(event):
-    """
-    Command: .scrape source_channel target_channel
-    Example: .scrape @source @target
-    """
     if not await check_auth(event):
         return
 
@@ -95,7 +84,6 @@ async def scrape_handler(event):
     status_msg = await event.reply(f"🔄 Starting scrape from {source_username} to {target_username}...")
 
     try:
-        # Resolve entities
         source_entity = await client.get_entity(source_username)
         target_entity = await client.get_entity(target_username)
     except Exception as e:
@@ -103,7 +91,6 @@ async def scrape_handler(event):
         return
 
     try:
-        # Note: Bots usually cannot get participants from groups they are not admin in.
         members = await client.get_participants(source_entity)
     except Exception as e:
         await status_msg.edit(f"❌ Error fetching members: {str(e)}\n\n(Note: Bots can often only see members if they are Admins in the group).")
@@ -113,15 +100,10 @@ async def scrape_handler(event):
     failed_count = 0
 
     await status_msg.edit(f"Found {len(members)} members. Starting to add...")
-
     me = await client.get_me()
 
     for member in members:
-        if member.bot:
-            continue
-        if member.deleted:
-            continue
-        if member.id == me.id:
+        if member.bot or member.deleted or member.id == me.id:
             continue
 
         try:
@@ -129,25 +111,17 @@ async def scrape_handler(event):
                 channel=target_entity,
                 users=[member]
             ))
-            
             added_count += 1
             logger.info(f"Added {member.id}")
-            
             if added_count % 10 == 0:
                 await status_msg.edit(f"Progress: Added {added_count} members...")
-            
             await asyncio.sleep(2) 
-
         except errors.PeerFloodError:
             logger.warning("Getting Flood Error. Waiting 60s.")
             await status_msg.edit(f"⚠️ FloodWait triggered. Pausing for 60s... (Added: {added_count})")
             await asyncio.sleep(60)
-        except errors.UserPrivacyRestrictedError:
+        except (errors.UserPrivacyRestrictedError, errors.UserBotError, errors.UserAlreadyParticipantError):
             failed_count += 1
-        except errors.UserBotError:
-            failed_count += 1
-        except errors.UserAlreadyParticipantError:
-            pass
         except errors.ChatAdminRequiredError:
              await status_msg.edit("❌ Error: You need to be an admin in the target channel to add members!")
              return
@@ -158,13 +132,36 @@ async def scrape_handler(event):
 
     await status_msg.edit(f"✅ **Scraping Completed!**\n\nSuccessful: {added_count}\nFailed/Privacy: {failed_count}")
 
-print("Starting Client...")
+# Web Server for Render Health Check
+async def health_check(request):
+    return web.Response(text="Bot is running!")
 
-# Start the client
-if BOT_TOKEN and session == 'bot_session':
-    client.start(bot_token=BOT_TOKEN)
-else:
-    client.start()
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"🌍 Web server started on port {PORT}")
 
-client.run_until_disconnected()
+async def main():
+    # Start Web Server
+    await start_web_server()
+    
+    # Start Telegram Client
+    logger.info("Starting Telegram Client...")
+    if BOT_TOKEN and session == 'bot_session':
+        await client.start(bot_token=BOT_TOKEN)
+    else:
+        await client.start()
+    
+    logger.info("✅ Client started successfully.")
+    
+    # Run until disconnected
+    await client.run_until_disconnected()
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
 
